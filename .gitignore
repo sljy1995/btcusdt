@@ -1,0 +1,7 @@
+binance_data/
+data_test/
+*.csv
+*.zip
+*.parquet
+__pycache__/
+venv/
