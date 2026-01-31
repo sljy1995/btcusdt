@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+from arch import arch_model
+
 
 def vol_cal(data: pd.DataFrame, window: int = 5, inplace: bool = False) -> pd.DataFrame:
     """
@@ -30,8 +32,6 @@ def vol_cal(data: pd.DataFrame, window: int = 5, inplace: bool = False) -> pd.Da
     rv_ann_name = f"rv_{window}m_ann"
     log_rv_ann = f"log_rv_{window}m_ann"
 
-    # Vectorised log returns (faster & cleaner)
-    data["log_return"] = np.log(data["close"]).diff()
 
     # Realized volatility
     data[rv_name] = np.sqrt(
@@ -93,6 +93,31 @@ def fit_to_har(df: pd.DataFrame, short: str = "5m", med: str = "60m", long: str 
     test["log_rv_hat"] = model.predict(X_test)
 
     return train, test, model
+
+def fit_garch_on_resid(resid: pd.Series):
+    """
+    Fit a GARCH(1,1) model to the residuals of actual vs predicted log volatility.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain 'log_target_rv' and 'log_rv_hat' columns.
+
+    Returns
+    -------
+    MLEResults
+        Fitted GARCH model results.
+    """
+
+    df = df.copy().dropna(subset=["log_target_rv", "log_rv_hat"])
+    df["residuals"] = df["log_target_rv"] - df["log_rv_hat"]
+
+    # Fit GARCH(1,1) model
+    garch_model = arch_model(df["residuals"], vol="Garch", p=1, q=1, mean="Zero", dist="normal")
+    garch_res = garch_model.fit(disp="off")
+
+
+    return garch_res
 
 def test_sig_up(data: pd.DataFrame, thr: float = 1.2) -> pd.DataFrame:
     """
