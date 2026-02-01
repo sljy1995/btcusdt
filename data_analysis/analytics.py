@@ -1,7 +1,9 @@
+import arch
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from arch import arch_model
+from statsmodels.tsa.arima.model import ARIMA
 
 
 def vol_cal(data: pd.DataFrame, window: int = 5, inplace: bool = False) -> pd.DataFrame:
@@ -94,30 +96,85 @@ def fit_to_har(df: pd.DataFrame, short: str = "5m", med: str = "60m", long: str 
 
     return train, test, model
 
-def fit_garch_on_resid(resid: pd.Series):
+def fit_ar_on_har_residuals(df: pd.DataFrame, resid_col: str = "har_resid", ar_order: int = 1,) -> tuple:
     """
-    Fit a GARCH(1,1) model to the residuals of actual vs predicted log volatility.
+    Fit AR(p) to HAR residuals and return AR model + innovations (whitened residuals).
 
     Parameters
     ----------
     df : pd.DataFrame
-        Must contain 'log_target_rv' and 'log_rv_hat' columns.
+        Must contain 'log_target_rv' and 'log_rv_hat'.
+    resid_col : str
+        Name to store HAR residuals.
+    ar_order : int
+        AR order p.
 
     Returns
     -------
-    MLEResults
-        Fitted GARCH model results.
+    ar_res : ARIMAResults
+        Fitted AR model on HAR residuals.
+    out_df : pd.DataFrame
+        Copy of df with columns: resid_col, 'ar_fitted', 'innov'
     """
+    out = df.copy().dropna(subset=["log_target_rv", "log_rv_hat"])
+    out[resid_col] = out["log_target_rv"] - out["log_rv_hat"]
+    out = out.reset_index(drop=True)
+    # AR(p) on residuals (ARIMA(p,0,0))
+    ar_mod = ARIMA(out[resid_col], order=(ar_order, 0, 0))
+    ar_res = ar_mod.fit()
 
-    df = df.copy().dropna(subset=["log_target_rv", "log_rv_hat"])
-    df["residuals"] = df["log_target_rv"] - df["log_rv_hat"]
+    # AR fitted values and innovations (whitened residuals)
+    out["ar_fitted"] = ar_res.fittedvalues
+    out["innov"] = out[resid_col] - out["ar_fitted"]
 
-    # Fit GARCH(1,1) model
-    garch_model = arch_model(df["residuals"], vol="Garch", p=1, q=1, mean="Zero", dist="normal")
-    garch_res = garch_model.fit(disp="off")
+    # Drop initial NaNs from AR fitting (fittedvalues/innov start after p lags)
+    out = out.dropna(subset=["innov"])
 
+    return ar_res, out
 
-    return garch_res
+def fit_garch_on_innovations(innov: pd.Series, p: int = 1, q: int = 1, dist: str = "normal") -> arch.univariate.base.ARCHModelResult:
+    """
+    Fit GARCH(p,q) on mean-cleaned innovations (after AR on HAR residuals).
+    """
+    innov = innov.dropna()
+    am = arch_model(innov, mean="Zero", vol="Garch", p=p, q=q, dist="t")
+    res = am.fit(disp="off")
+    return res
+
+def forecast_test_har_ar(train_df, test_df, har_model, ar_res, short_col="log_rv_5m_ann", med_col="log_rv_60m_ann", long_col="log_rv_1440m_ann"):
+    
+    phi = float(ar_res.params["ar.L1"])
+
+    preds = []
+    actuals = []
+
+    # last observed HAR residual from TRAIN
+    last_resid = train_df.iloc[-1]["log_target_rv"] - train_df.iloc[-1]["log_rv_hat"]
+
+    for i in range(len(test_df)):
+        row = test_df.iloc[i]
+
+        # 1) HAR mean forecast
+        X = sm.add_constant(
+            row[[short_col, med_col, long_col]].to_frame().T,
+            has_constant="add",
+        )
+        har_mean = float(har_model.predict(X).iloc[0])
+
+        # 2) AR(1) residual forecast
+        e_hat = phi * last_resid
+
+        # 3) Combined forecast
+        y_hat = har_mean + e_hat
+
+        preds.append(y_hat)
+        actuals.append(row["log_target_rv"])
+
+        # 4) update residual using REALIZED value
+        last_resid = row["log_target_rv"] - har_mean
+
+    return np.array(preds), np.array(actuals)
+
 
 def test_sig_up(data: pd.DataFrame, thr: float = 1.2) -> pd.DataFrame:
     """
